@@ -1,0 +1,120 @@
+name: Sync Version – wysiwyg-rails
+ 
+on:
+  repository_dispatch:
+    types: [version_update]
+ 
+permissions:
+  contents: write
+  pull-requests: write
+ 
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+ 
+    steps:
+      # --------------------------------------------
+      # Checkout Rails repository (full history)
+      # --------------------------------------------
+      - name: Checkout Rails repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}
+          fetch-depth: 0
+ 
+      # --------------------------------------------
+      # Load version & release notes from payload
+      # --------------------------------------------
+      - name: Load payload
+        run: |
+          VERSION="${{ github.event.client_payload.version }}"
+          VERSION="${VERSION//,/\.}"
+ 
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "${{ github.event.client_payload.release_notes }}" > release_notes.txt
+ 
+          echo "Incoming version: $VERSION"
+ 
+      # --------------------------------------------
+      # Validate SemVer (fail fast)
+      # --------------------------------------------
+      - name: Validate version format
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid version format: $VERSION"
+            exit 1
+          fi
+ 
+      # --------------------------------------------
+      # Prepare release branch (safe & idempotent)
+      # --------------------------------------------
+      - name: Prepare release branch
+        run: |
+          BRANCH="release-v${VERSION}"
+          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
+ 
+          git fetch origin
+ 
+          if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+            echo "Release branch already exists. Reusing it."
+            git checkout "$BRANCH"
+            git pull origin "$BRANCH"
+          else
+            echo "Creating new release branch $BRANCH"
+            git checkout -b "$BRANCH"
+          fi
+ 
+      # --------------------------------------------
+      # Update version.rb
+      # --------------------------------------------
+      - name: Update version.rb
+        run: |
+          sed -i -E "s/[0-9]+[.,][0-9]+[.,][0-9]+/$VERSION/" \
+            lib/wysiwyg-rails/version.rb
+ 
+      # --------------------------------------------
+      # Sync JS/CSS from primary repo (FIXED)
+      # --------------------------------------------
+      - name: Sync JS/CSS from primary repo
+        env:
+          GIT_TOKEN: ${{ secrets.PAT }}
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${GIT_TOKEN}@github.com/srkdev404-cyber/wysiwyg-editor-primary.git" \
+            /tmp/wysiwyg-main
+ 
+          rsync -av --delete /tmp/wysiwyg-main/js/ app/assets/javascripts/
+          rsync -av --delete /tmp/wysiwyg-main/css/ app/assets/stylesheets/
+ 
+      # --------------------------------------------
+      # Commit & push changes (safe on reruns)
+      # --------------------------------------------
+      - name: Commit and push changes
+        run: |
+          git config user.name "srkdev404-cyber"
+          git config user.email "srkdev404@gmail.com"
+ 
+          git add \
+            lib/wysiwyg-rails/version.rb \
+            app/assets/javascripts \
+            app/assets/stylesheets \
+            release_notes.txt
+ 
+          git commit -m "chore: release v${VERSION} (sync version, assets, and release notes)" \
+            || echo "Nothing to commit"
+ 
+          git push origin "$BRANCH"
+ 
+      # --------------------------------------------
+      # Create Pull Request (idempotent)
+      # --------------------------------------------
+      - name: Create Pull Request
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          gh pr create \
+            --base master \
+            --head "$BRANCH" \
+            --title "Release v${VERSION}" \
+            --body "release: yes" \
+            || echo "Pull request already exists"
