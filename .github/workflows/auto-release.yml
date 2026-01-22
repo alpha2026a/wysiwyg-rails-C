@@ -11,22 +11,22 @@ permissions:
  
 jobs:
   release:
+    # Run only when PR is merged
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
  
     steps:
       # --------------------------------------------
-      # Check release intent from PR title/body
+      # Validate release intent
       # --------------------------------------------
-      - name: Check release intent
-        id: check
+      - name: Validate release intent
+        id: intent
         uses: actions/github-script@v6
         with:
-          github-token: ${{ secrets.PAT }}
           script: |
-            const title = context.payload.pull_request.title || '';
             const body  = context.payload.pull_request.body || '';
-            const text  = `${title} ${body}`;
+            const title = context.payload.pull_request.title || '';
+            const text  = `${title}\n${body}`;
  
             core.setOutput(
               'release',
@@ -34,46 +34,19 @@ jobs:
             );
  
       - name: Stop if not a release PR
-        if: steps.check.outputs.release == 'false'
+        if: steps.intent.outputs.release == 'false'
         run: |
-          echo "Not a release PR. Exiting."
+          echo "ℹ️ Not a release PR. Skipping auto-release."
           exit 0
  
       # --------------------------------------------
-      # Checkout merged code (full history)
+      # Checkout merged code
       # --------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.PAT }}
           fetch-depth: 0
- 
-      # --------------------------------------------
-      # Read version from version.rb
-      # --------------------------------------------
-      - name: Read version
-        run: |
-          VERSION=$(ruby -e "
-            content = File.read('lib/wysiwyg-rails/version.rb')
-            match = content.match(/VERSION\s*=\s*['\"]([^'\"]+)['\"]/)
-            abort('VERSION not found') unless match
-            puts match[1]
-          ")
- 
-          VERSION="${VERSION//,/\.}"
- 
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "Resolved version: $VERSION"
- 
-      # --------------------------------------------
-      # Validate SemVer (strict, fail fast)
-      # --------------------------------------------
-      - name: Validate version format
-        run: |
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Invalid version format: $VERSION"
-            exit 1
-          fi
  
       # --------------------------------------------
       # Setup Ruby
@@ -84,21 +57,55 @@ jobs:
           ruby-version: '3.1'
  
       # --------------------------------------------
+      # Read version from version.rb (single source)
+      # --------------------------------------------
+      - name: Read version from version.rb
+        run: |
+          VERSION=$(ruby -e "require './lib/wysiwyg-rails/version'; puts WYSIWYG::Rails::VERSION")
+ 
+          if [ -z "$VERSION" ]; then
+            echo "❌ Failed to read version from version.rb"
+            exit 1
+          fi
+ 
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "❌ Invalid version format: $VERSION"
+            exit 1
+          fi
+ 
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "✅ Releasing version $VERSION"
+ 
+      # --------------------------------------------
+      # Prepare clean release notes
+      # --------------------------------------------
+      - name: Prepare release notes
+        run: |
+          PR_BODY="${{ github.event.pull_request.body }}"
+ 
+          CLEAN_NOTES=$(echo "$PR_BODY" | sed \
+            -e '/^release:\s*/Id' \
+            -e '/^## Release Notes.*$/Id')
+ 
+          echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
+          echo "$CLEAN_NOTES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+ 
+      # --------------------------------------------
       # Build gem
       # --------------------------------------------
       - name: Build gem
-        run: |
-          gem build wysiwyg-rails.gemspec
+        run: gem build wysiwyg-rails.gemspec
  
       # --------------------------------------------
-      # Create GitHub Release (NO auto-generated notes)
+      # Create GitHub Release (UI-perfect)
       # --------------------------------------------
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: "rails-v${{ env.VERSION }}"
-          name: "Rails Release v${{ env.VERSION }}"
-          body_path: release_notes.txt
-          files: "*.gem"
         env:
           GITHUB_TOKEN: ${{ secrets.PAT }}
+        run: |
+          gh release create "v${VERSION}" \
+            --title "Release ${VERSION}" \
+            --notes "$RELEASE_NOTES" \
+            --latest \
+            *.gem
